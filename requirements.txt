@@ -22,3 +22,6 @@ requests
 
 # Windows specific
 pywin32
+
+# PyInstaller
+pyinstaller

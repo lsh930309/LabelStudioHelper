@@ -17,7 +17,6 @@ a = Analysis(
     binaries=[],
     datas=[
         ('core', 'core'),
-        ('utils', 'utils'),
         # Python 표준 라이브러리 (PyTorch import에 필수)
         (str(python_lib / 'modulefinder.py'), 'Lib'),
         (str(python_lib / 'importlib'), 'Lib/importlib'),

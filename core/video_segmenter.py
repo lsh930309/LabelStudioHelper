@@ -581,7 +581,7 @@ class VideoSegmenter:
         # Feature Extractor 초기화
         if self.gpu_available:
             try:
-                from tools.feature_extractor import FeatureExtractor
+                from core.feature_extractor import FeatureExtractor
                 self.feature_extractor = FeatureExtractor(device=self.device, use_fp16=True)
             except Exception as e:
                 print(f"⚠️ Feature Extractor 초기화 실패: {e}")
@@ -662,18 +662,18 @@ class VideoSegmenter:
             if utils_dir.exists() and str(utils_dir) not in sys.path:
                 sys.path.insert(0, str(utils_dir))
 
-            # 2. PyTorch 설치 확인
+            # 2. PyTorch 설치 확인 (APPDATA 경로 또는 시스템 PyTorch)
             try:
-                from utils.pytorch_installer import PyTorchInstaller
+                from core.pytorch_installer import PyTorchInstaller
                 installer = PyTorchInstaller.get_instance()
 
-                if not installer.is_pytorch_installed():
-                    print("⚠️ PyTorch가 설치되지 않았습니다. CPU 모드로 실행합니다.")
-                    print("   GPU 가속을 사용하려면 GUI에서 'GPU 가속' 체크박스를 활성화하세요.")
-                    return False
-
-                # sys.path에 PyTorch 경로 추가
-                installer.add_to_path()
+                if installer.is_pytorch_installed():
+                    # APPDATA에 설치된 PyTorch가 있으면 경로 추가
+                    installer.add_to_path()
+                    print("✅ APPDATA PyTorch 경로 추가됨")
+                else:
+                    # APPDATA에 없어도 시스템/venv PyTorch 사용 가능
+                    print("ℹ️ APPDATA에 PyTorch가 없습니다. 시스템/venv PyTorch를 확인합니다...")
 
             except ImportError:
                 # PyTorchInstaller를 찾을 수 없는 경우 (이전 버전 호환성)
@@ -716,9 +716,11 @@ class VideoSegmenter:
                 print("⚠️ CUDA를 사용할 수 없습니다. CPU 모드로 실행합니다.")
                 return False
 
-        except ImportError:
-            print("⚠️ PyTorch가 설치되지 않았습니다. CPU 모드로 실행합니다.")
-            print("   GPU 가속을 사용하려면 GUI에서 'GPU 가속' 체크박스를 활성화하세요.")
+        except ImportError as e:
+            print(f"⚠️ PyTorch import 실패: {e}")
+            print("   GPU 가속을 사용하려면 PyTorch를 설치해주세요.")
+            import traceback
+            traceback.print_exc()
             return False
         except (OSError, RuntimeError) as e:
             # DLL 로딩 실패 또는 CUDA 초기화 오류
