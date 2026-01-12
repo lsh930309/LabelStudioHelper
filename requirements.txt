@@ -1,0 +1,25 @@
+# Label Studio Helper Dependencies
+# PyTorch는 제외 (런타임에 PyTorchInstaller가 자동 설치)
+
+# UI Framework
+gradio>=4.0.0
+
+# Video Processing
+opencv-python==4.12.0.88
+av==16.0.1  # PyAV for AV1 codec support
+numpy>=1.24.0,<2.0.0
+Pillow==12.0.0
+
+# Image Processing
+scikit-image==0.25.2
+scipy==1.16.3
+
+# Visualization
+matplotlib
+
+# Utilities
+psutil==7.1.0
+requests==2.32.5
+
+# Windows specific
+pywin32==311; sys_platform == 'win32'
