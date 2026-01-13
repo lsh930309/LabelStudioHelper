@@ -566,7 +566,7 @@ class SegmentConfig:
     ssim_scale: float = 1.0              # (사용 안 함, 호환성 유지)
     frame_skip: int = 1                  # (사용 안 함, feature_sample_rate로 대체됨)
     use_gpu: bool = False                # GPU 가속 사용 (CUDA 필수)
-    initial_batch_size: int = 512        # 초기 배치 크기 (파이프라이닝 최적화, 동적 조정됨)
+    initial_batch_size: int = 64        # 초기 배치 크기 (파이프라이닝 최적화, 동적 조정됨)
     max_vram_usage: float = 0.90         # 최대 VRAM 사용률 (90%, 여유 확보)
 
     # 실험 기능
