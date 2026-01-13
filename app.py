@@ -139,6 +139,7 @@ def segment_video_ui(
     static_threshold: float,
     min_static_duration_frames: int,
     target_duration: float,
+    feature_sample_rate: int,
     use_gpu: bool,
     save_discarded: bool,
     output_directory: str,
@@ -185,7 +186,7 @@ def segment_video_ui(
             static_threshold=static_threshold,
             min_static_duration=min_static_duration,
             target_segment_duration=target_duration,
-            feature_sample_rate=1,
+            feature_sample_rate=feature_sample_rate,
             use_gpu=use_gpu,
             enable_visualization=True,
             save_discarded=save_discarded
@@ -354,7 +355,7 @@ def create_ui():
                         static_threshold = gr.Slider(
                             minimum=0.8,
                             maximum=0.99,
-                            value=config_manager.get('segmentation.static_threshold', 0.97),
+                            value=config_manager.get('segmentation.static_threshold', 0.95),
                             step=0.01,
                             label="정적 임계값",
                             info="높을수록 더 많이 제거됨"
@@ -374,6 +375,17 @@ def create_ui():
                             step=5,
                             label="목표 세그먼트 길이 (초)"
                         )
+
+                        with gr.Accordion("⚡ 고급 설정", open=False):
+                            feature_sample_rate = gr.Slider(
+                                minimum=1,
+                                maximum=30,
+                                value=config_manager.get('segmentation.feature_sample_rate', 1),
+                                step=1,
+                                label="프레임 샘플링 레이트",
+                                info="N프레임마다 유사도 검사 (1=모든 프레임, 2=한 프레임 건너뛰기, 높을수록 빠르지만 정확도 감소)"
+                            )
+
                         use_gpu = gr.Checkbox(
                             label="GPU 가속 사용",
                             value=config_manager.get('segmentation.use_gpu', True),
@@ -424,6 +436,7 @@ def create_ui():
                         static_threshold,
                         min_static_duration_frames,
                         target_duration,
+                        feature_sample_rate,
                         use_gpu,
                         save_discarded,
                         output_directory

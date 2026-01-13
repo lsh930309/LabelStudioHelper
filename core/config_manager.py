@@ -41,6 +41,7 @@ class ConfigManager:
                 'target_duration': 30.0,
                 'use_gpu': True,
                 'save_discarded': False,
+                'feature_sample_rate': 1,  # N프레임마다 유사도 검사 (1=모든 프레임, 2=한 프레임 건너뛰기)
             }
         }
 

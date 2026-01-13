@@ -827,7 +827,7 @@ class VideoSegmenter:
             free_ratio = free_mem / total_mem
             
             # 1. 메모리 부족 시 배치 크기 감소 (Proactive)
-            # 남은 메모리가 25% 미만이면 배치 크기 감소
+            # 남은 메모리가 10% 미만이면 배치 크기 감소
             if free_ratio < (1 - self.config.max_vram_usage):
                 if self.current_batch_size > 1:
                     old_size = self.current_batch_size
@@ -839,7 +839,7 @@ class VideoSegmenter:
 
             # 2. 메모리 여유 시 배치 크기 증가 (더 공격적으로)
             # 남은 메모리가 40% 이상이고 현재 배치가 최대가 아니면 증가
-            max_batch_size = 2048  # 최대 배치 크기 (파이프라이닝 효과 극대화)
+            max_batch_size = 128  # 최대 배치 크기 (파이프라이닝 효과 극대화)
             if free_ratio > 0.4 and self.current_batch_size < max_batch_size:
                 old_size = self.current_batch_size
                 # 1.5배씩 증가 (2배는 너무 급격함)
