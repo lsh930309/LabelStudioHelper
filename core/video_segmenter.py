@@ -168,9 +168,10 @@ class GPUResourceManager:
 def extract_keyframes(video_path: Path) -> List[float]:
     """
     비디오의 모든 I-Frame(Keyframe) 타임스탬프 추출
-    
-    1. 고속 모드 (Packet Header): 컨테이너의 패킷 플래그만 확인 (매우 빠름)
-    2. 정밀 모드 (Frame Decode): 실제 프레임 디코딩 (느림, 고속 모드 실패 시 Fallback)
+
+    1. FFmpeg/ffprobe 사용 가능 여부 확인 (필수)
+    2. 고속 모드 (Packet Header): 컨테이너의 패킷 플래그만 확인 (매우 빠름)
+    3. 정밀 모드 (Frame Decode): 실제 프레임 디코딩 (느림, 고속 모드 실패 시 Fallback)
 
     Args:
         video_path: 비디오 파일 경로
@@ -178,6 +179,11 @@ def extract_keyframes(video_path: Path) -> List[float]:
     Returns:
         Keyframe 타임스탬프 리스트 (초 단위, 정렬됨)
     """
+    # FFmpeg/ffprobe 확인
+    if shutil.which('ffprobe') is None:
+        print("⚠️ ffprobe를 찾을 수 없습니다. Keyframe 인덱싱을 건너뜁니다.")
+        return []
+
     print("🔍 Keyframe 인덱싱 시작 (고속 모드)...")
     
     # 1. 고속 모드 시도 (Packet)
@@ -354,6 +360,23 @@ def snap_to_keyframe(time: float, keyframes: List[float], direction: str = 'befo
         return keyframes[idx]
 
 
+def check_pyav_available() -> bool:
+    """
+    PyAV 사용 가능 여부 확인
+
+    Returns:
+        bool: PyAV를 사용할 수 있으면 True
+    """
+    try:
+        import av
+        # av.open이 실제로 존재하는지 확인 (fake 모듈 방지)
+        if not hasattr(av, 'open') or not callable(av.open):
+            return False
+        return True
+    except ImportError:
+        return False
+
+
 class PyAVVideoReader:
     """
     PyAV를 사용한 비디오 리더 (OpenCV가 지원하지 않는 코덱 처리)
@@ -381,6 +404,13 @@ class PyAVVideoReader:
         Returns:
             bool: 성공 여부
         """
+        # PyAV 사용 가능 여부 확인
+        if not check_pyav_available():
+            print("⚠️ PyAV가 설치되지 않았거나 사용할 수 없습니다.")
+            print("   설치 방법: pip install av")
+            print("   또는 OpenCV가 지원하는 코덱의 비디오를 사용해주세요.")
+            return False
+
         try:
             import av
 
@@ -405,12 +435,10 @@ class PyAVVideoReader:
 
             return True
 
-        except ImportError:
-            print("⚠️ PyAV가 설치되지 않았습니다.")
-            print("   설치 방법: pip install av")
-            return False
         except Exception as e:
             print(f"⚠️ PyAV로 비디오 열기 실패: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     def read(self):
@@ -538,8 +566,8 @@ class SegmentConfig:
     ssim_scale: float = 1.0              # (사용 안 함, 호환성 유지)
     frame_skip: int = 1                  # (사용 안 함, feature_sample_rate로 대체됨)
     use_gpu: bool = False                # GPU 가속 사용 (CUDA 필수)
-    initial_batch_size: int = 128        # 초기 배치 크기 (동적 조정됨)
-    max_vram_usage: float = 0.85         # 최대 VRAM 사용률 (85%)
+    initial_batch_size: int = 512        # 초기 배치 크기 (파이프라이닝 최적화, 동적 조정됨)
+    max_vram_usage: float = 0.90         # 최대 VRAM 사용률 (90%, 여유 확보)
 
     # 실험 기능
     save_discarded: bool = False         # 채택되지 않은 구간도 별도 저장
@@ -582,7 +610,13 @@ class VideoSegmenter:
         if self.gpu_available:
             try:
                 from core.feature_extractor import FeatureExtractor
-                self.feature_extractor = FeatureExtractor(device=self.device, use_fp16=True)
+                # use_compile=True: torch.compile() 사용 (기본값, 20-30% 빠름)
+                # use_compile=False: 문제 발생 시 비활성화
+                self.feature_extractor = FeatureExtractor(
+                    device=self.device,
+                    use_fp16=True,
+                    use_compile=True  # torch.compile() 사용
+                )
             except Exception as e:
                 print(f"⚠️ Feature Extractor 초기화 실패: {e}")
                 print("   CPU 모드로 전환합니다.")
@@ -803,11 +837,13 @@ class VideoSegmenter:
                     print(f"⚠️ VRAM 여유 부족 ({free_ratio*100:.1f}%), 배치 크기 감소: {old_size} → {self.current_batch_size}")
                 return
 
-            # 2. 메모리 여유 시 배치 크기 증가
-            # 남은 메모리가 60% 이상이고 (보수적 접근) 현재 배치가 최대가 아니면 증가
-            if free_ratio > 0.6 and self.current_batch_size < 512:
+            # 2. 메모리 여유 시 배치 크기 증가 (더 공격적으로)
+            # 남은 메모리가 40% 이상이고 현재 배치가 최대가 아니면 증가
+            max_batch_size = 2048  # 최대 배치 크기 (파이프라이닝 효과 극대화)
+            if free_ratio > 0.4 and self.current_batch_size < max_batch_size:
                 old_size = self.current_batch_size
-                self.current_batch_size = min(512, self.current_batch_size * 2)
+                # 1.5배씩 증가 (2배는 너무 급격함)
+                self.current_batch_size = min(max_batch_size, int(self.current_batch_size * 1.5))
                 if old_size != self.current_batch_size:
                     self.stats['batch_size_adjustments'] += 1
                     print(f"🚀 GPU 여유 메모리 확보 ({free_ratio*100:.1f}%), 배치 크기 증가: {old_size} → {self.current_batch_size}")
@@ -913,10 +949,33 @@ class VideoSegmenter:
         Returns:
             VideoSegment 리스트 (Virtual Timeline 기반)
         """
+        # FFmpeg 확인 및 자동 설치 (Keyframe 인덱싱 전에 필수)
+        print("🔍 FFmpeg 확인 중...")
+        if not check_and_install_ffmpeg():
+            raise RuntimeError(
+                "FFmpeg를 사용할 수 없습니다. "
+                "Keyframe 인덱싱이 불가능합니다. "
+                "수동으로 FFmpeg를 설치하거나 시스템을 재시작해주세요."
+            )
+
         # Keyframe 인덱싱 (활성화 시)
         if self.config.enable_keyframe_snap:
-            print("🔍 Keyframe 인덱싱 중...")
+            print("🔍 Keyframe 인덱싱 시작...")
             self.keyframes = extract_keyframes(video_path)
+
+            # Keyframe 추출 실패 시 FFmpeg 재설치 권장
+            if not self.keyframes:
+                print("⚠️ Keyframe 추출에 실패했습니다.")
+                print("   FFmpeg가 올바르게 설치되지 않았을 수 있습니다.")
+                print("   FFmpeg 재설치를 시도합니다...")
+
+                # FFmpeg 재확인 (강제 재설치는 하지 않음)
+                if shutil.which('ffmpeg') is None:
+                    print("   FFmpeg가 PATH에서 제거되었습니다. 재설치를 권장합니다.")
+                    # 재설치 시도는 사용자가 수동으로 해야 하므로 경고만 출력
+                else:
+                    print("   FFmpeg는 설치되어 있지만 Keyframe 추출에 실패했습니다.")
+                    print("   비디오 파일이 손상되었거나 지원하지 않는 코덱일 수 있습니다.")
 
         # GPU Resource Manager 사용
         with GPUResourceManager(self.device):
@@ -950,11 +1009,29 @@ class VideoSegmenter:
         using_pyav = False
 
         if not cap.isOpened():
-            print("⚠️ OpenCV로 비디오를 열 수 없어 PyAV로 전환합니다.")
-            cap = PyAVVideoReader(video_path)
-            if not cap.open():
-                raise RuntimeError(f"비디오를 열 수 없습니다: {video_path}")
-            using_pyav = True
+            print("⚠️ OpenCV로 비디오를 열 수 없습니다.")
+
+            # PyAV 사용 가능 여부 확인
+            if check_pyav_available():
+                print("   → PyAV로 전환 시도...")
+                cap = PyAVVideoReader(video_path)
+                if not cap.open():
+                    raise RuntimeError(
+                        f"비디오를 열 수 없습니다: {video_path}\n"
+                        f"   - OpenCV 실패\n"
+                        f"   - PyAV 실패\n"
+                        f"   비디오 파일이 손상되었거나 지원하지 않는 형식일 수 있습니다."
+                    )
+                using_pyav = True
+            else:
+                raise RuntimeError(
+                    f"비디오를 열 수 없습니다: {video_path}\n"
+                    f"   - OpenCV가 이 비디오를 열 수 없습니다.\n"
+                    f"   - PyAV가 설치되지 않아 대체 방법을 사용할 수 없습니다.\n\n"
+                    f"해결 방법:\n"
+                    f"   1. 비디오를 H.264 코덱으로 다시 인코딩\n"
+                    f"   2. 또는 PyAV 설치: pip install av"
+                )
 
         fps = cap.get(cv2.CAP_PROP_FPS) if not using_pyav else cap.fps
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if not using_pyav else cap.total_frames
@@ -970,20 +1047,42 @@ class VideoSegmenter:
         # 2단계: 첫 프레임 읽기 검증
         ret, prev_frame = cap.read()
         if not ret and not using_pyav:
-            print("⚠️ OpenCV로 첫 프레임 읽기 실패. PyAV로 전환합니다.")
+            print("⚠️ OpenCV로 첫 프레임 읽기 실패.")
             cap.release()
-            cap = PyAVVideoReader(video_path)
-            if not cap.open():
-                raise RuntimeError("PyAV로도 비디오를 열 수 없습니다")
-            using_pyav = True
-            fps = cap.fps
-            total_frames = cap.total_frames
-            self.stats['total_frames'] = total_frames
-            ret, prev_frame = cap.read()
+
+            # PyAV 사용 가능 여부 확인
+            if check_pyav_available():
+                print("   → PyAV로 전환 시도...")
+                cap = PyAVVideoReader(video_path)
+                if not cap.open():
+                    raise RuntimeError(
+                        f"비디오를 읽을 수 없습니다: {video_path}\n"
+                        f"   - OpenCV 프레임 읽기 실패\n"
+                        f"   - PyAV 열기 실패\n"
+                        f"   비디오 파일이 손상되었을 수 있습니다."
+                    )
+                using_pyav = True
+                fps = cap.fps
+                total_frames = cap.total_frames
+                self.stats['total_frames'] = total_frames
+                ret, prev_frame = cap.read()
+            else:
+                raise RuntimeError(
+                    f"비디오 프레임을 읽을 수 없습니다: {video_path}\n"
+                    f"   - OpenCV가 첫 프레임을 읽을 수 없습니다.\n"
+                    f"   - PyAV가 설치되지 않아 대체 방법을 사용할 수 없습니다.\n\n"
+                    f"해결 방법:\n"
+                    f"   1. 비디오를 H.264 코덱으로 다시 인코딩\n"
+                    f"   2. 또는 PyAV 설치: pip install av\n"
+                    f"   3. 비디오 파일이 손상되지 않았는지 확인"
+                )
 
         if not ret:
             cap.release()
-            raise RuntimeError("첫 프레임을 읽을 수 없습니다")
+            raise RuntimeError(
+                f"첫 프레임을 읽을 수 없습니다: {video_path}\n"
+                f"   비디오 파일이 손상되었거나 비어있을 수 있습니다."
+            )
 
         frame_idx = 0
         static_intervals = []
@@ -1418,7 +1517,7 @@ class VideoSegmenter:
 
         그래프 구성:
         - X축: 시간(초)
-        - Y축: 유사도 점수 (0~1)
+        - Y축: 유사도 점수 (동적 범위, 0.9 이상만 표시)
         - 빨간 영역: 정적 구간 (제거될 부분)
         - 녹색 영역: 유효 구간 (사용될 부분)
         - 파란 선: 세그먼트 경계 (30초 단위)
@@ -1437,6 +1536,19 @@ class VideoSegmenter:
             scores = [score for _, score in self.similarity_scores_cache]
             times = [frame_idx / fps for frame_idx in frame_numbers]
 
+            # Y축 범위 동적 결정 (0.9 이상만 표시)
+            min_score = min(scores) if scores else 0.0
+            max_score = max(scores) if scores else 1.0
+
+            # 대부분의 값이 0.9 이상인 경우 Y축 범위 조정
+            if min_score > 0.9:
+                y_min = max(0.9, min_score - 0.02)  # 최소값에서 2% 여유
+                y_max = min(1.0, max_score + 0.01)  # 최대값에서 1% 여유
+            else:
+                # 일부 값이 0.9 미만인 경우 전체 범위 표시
+                y_min = max(0.0, min_score - 0.05)
+                y_max = min(1.0, max_score + 0.05)
+
             # 그래프 생성
             fig, ax = plt.subplots(figsize=(16, 6))
 
@@ -1451,14 +1563,15 @@ class VideoSegmenter:
             for idx, segment in enumerate(segments):
                 ax.axvline(x=segment.start_time, color='blue', linestyle='--', linewidth=1.5, alpha=0.7, label='Segment Boundary' if idx == 0 else '')
 
-            # 임계값 선 표시
-            ax.axhline(y=self.config.static_threshold, color='orange', linestyle=':', linewidth=2, label=f'Static Threshold ({self.config.static_threshold})')
+            # 임계값 선 표시 (Y축 범위 내에 있을 때만)
+            if y_min <= self.config.static_threshold <= y_max:
+                ax.axhline(y=self.config.static_threshold, color='orange', linestyle=':', linewidth=2, label=f'Static Threshold ({self.config.static_threshold})')
 
             # 레이블 및 제목
             ax.set_xlabel('Time (seconds)', fontsize=12)
             ax.set_ylabel('Cosine Similarity', fontsize=12)
-            ax.set_title('Video Similarity Analysis (ResNet-based)', fontsize=14, fontweight='bold')
-            ax.set_ylim(0, 1.05)
+            ax.set_title(f'Video Similarity Analysis (ResNet-based) - Range: {y_min:.3f} ~ {y_max:.3f}', fontsize=14, fontweight='bold')
+            ax.set_ylim(y_min, y_max)
             ax.grid(True, alpha=0.3)
             ax.legend(loc='upper right', fontsize=10)
 
@@ -1468,7 +1581,7 @@ class VideoSegmenter:
             plt.savefig(output_path, dpi=150)
             plt.close()
 
-            print(f"📊 유사도 그래프 저장: {output_path}")
+            print(f"📊 유사도 그래프 저장: {output_path} (Y축 범위: {y_min:.3f} ~ {y_max:.3f})")
 
         except ImportError:
             print("⚠️ matplotlib가 설치되지 않아 시각화를 건너뜁니다.")

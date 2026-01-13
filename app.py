@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 from typing import Optional, Tuple
 import logging
+import os
 
 # 로깅 설정
 logging.basicConfig(
@@ -20,6 +21,9 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+# Config Manager import
+from core.config_manager import ConfigManager
 
 
 def check_admin_rights() -> bool:
@@ -133,9 +137,11 @@ def install_pytorch_ui(progress=gr.Progress()):
 def segment_video_ui(
     video_file,
     static_threshold: float,
-    min_static_duration: float,
+    min_static_duration_frames: int,
     target_duration: float,
     use_gpu: bool,
+    save_discarded: bool,
+    output_directory: str,
     progress=gr.Progress()
 ):
     """
@@ -147,12 +153,31 @@ def segment_video_ui(
     try:
         from core.video_segmenter import VideoSegmenter, SegmentConfig
         from pathlib import Path
+        import cv2
+
+        # Config Manager 인스턴스
+        config_manager = ConfigManager.get_instance()
+
+        # 마지막 입력 디렉토리 저장
+        video_path = Path(video_file) if isinstance(video_file, str) else Path(video_file.name)
+        config_manager.set_last_input_directory(str(video_path.parent))
 
         # PyTorch 설치 확인 (GPU 사용 시)
         if use_gpu:
             installed, _ = check_pytorch_installation()
             if not installed:
                 return "❌ GPU 가속을 사용하려면 먼저 PyTorch를 설치해주세요.", None
+
+        # FPS 정보 가져오기 (프레임 → 초 변환용)
+        cap = cv2.VideoCapture(str(video_path))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        cap.release()
+
+        if fps == 0:
+            fps = 30.0  # 기본값
+
+        # 프레임 단위 → 초 단위 변환
+        min_static_duration = min_static_duration_frames / fps
 
         # 설정
         config = SegmentConfig(
@@ -162,13 +187,21 @@ def segment_video_ui(
             target_segment_duration=target_duration,
             feature_sample_rate=1,
             use_gpu=use_gpu,
-            enable_visualization=True
+            enable_visualization=True,
+            save_discarded=save_discarded
         )
 
-        # 출력 디렉토리 - gradio type="filepath"는 문자열 경로를 직접 반환
-        video_path = Path(video_file) if isinstance(video_file, str) else Path(video_file.name)
-        output_dir = video_path.parent / "result_seg"
-        output_dir.mkdir(exist_ok=True)
+        # 출력 디렉토리 결정
+        if output_directory and output_directory.strip():
+            output_dir = Path(output_directory)
+        else:
+            # 설정에서 가져오기
+            output_dir = config_manager.get_output_directory(video_path)
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # 마지막 출력 디렉토리 저장
+        config_manager.set_last_output_directory(str(output_dir.parent))
 
         progress(0, desc="세그멘테이션 초기화 중...")
         segmenter = VideoSegmenter(config)
@@ -218,8 +251,59 @@ def segment_video_ui(
         return f"❌ 오류 발생: {e}", None
 
 
+def open_explorer():
+    """Windows 탐색기를 열어 사용자가 경로를 선택하도록 안내"""
+    try:
+        import subprocess
+        from pathlib import Path
+
+        config_manager = ConfigManager.get_instance()
+        last_dir = config_manager.get_last_output_directory()
+
+        # 마지막 디렉토리가 없으면 홈 디렉토리
+        if not last_dir or not Path(last_dir).exists():
+            last_dir = str(Path.home())
+
+        # Windows 탐색기 열기
+        subprocess.Popen(['explorer', last_dir])
+
+        return f"📂 탐색기가 열렸습니다.\n경로를 복사하여 위 텍스트 박스에 붙여넣어주세요.\n\n현재 설정: {config_manager.get('output_directory', '(비어있음 - 입력 파일 위치 사용)')}"
+
+    except Exception as e:
+        logger.error(f"탐색기 열기 오류: {e}")
+        return f"❌ 탐색기를 열 수 없습니다: {e}\n\n직접 경로를 입력해주세요."
+
+
+def save_output_directory(directory: str):
+    """출력 디렉토리 저장"""
+    try:
+        config_manager = ConfigManager.get_instance()
+
+        if directory and directory.strip():
+            directory = directory.strip()
+            # 경로 유효성 검사
+            path = Path(directory)
+            if not path.exists():
+                return f"⚠️ 경로가 존재하지 않습니다: {directory}\n\n계속 사용하시려면 디렉토리를 생성해주세요."
+
+            config_manager.set_output_directory(directory)
+            config_manager.set_last_output_directory(str(path.parent))
+            return f"✅ 출력 디렉토리 저장 완료!\n\n{directory}"
+        else:
+            # 비어있으면 기본값 사용
+            config_manager.set_output_directory('')
+            return "ℹ️ 출력 디렉토리가 비워졌습니다.\n입력 파일과 같은 위치의 result_seg 폴더를 사용합니다."
+
+    except Exception as e:
+        logger.error(f"디렉토리 저장 중 오류: {e}")
+        return f"❌ 오류 발생: {e}"
+
+
 def create_ui():
     """gradio UI 생성"""
+
+    # Config Manager 인스턴스
+    config_manager = ConfigManager.get_instance()
 
     # 테마
     theme = gr.themes.Soft(
@@ -248,34 +332,57 @@ def create_ui():
                             type="filepath"
                         )
 
+                        gr.Markdown("### 📁 출력")
+                        output_directory = gr.Textbox(
+                            label="출력 디렉토리",
+                            value=config_manager.get('output_directory', ''),
+                            placeholder="비어있으면 입력 파일과 같은 위치의 result_seg 폴더",
+                            interactive=True
+                        )
+                        with gr.Row():
+                            open_explorer_btn = gr.Button("📂 탐색기 열기", size="sm")
+                            save_output_btn = gr.Button("💾 저장", size="sm", variant="primary")
+
+                        output_status = gr.Textbox(
+                            label="출력 디렉토리 상태",
+                            lines=3,
+                            interactive=False,
+                            visible=False
+                        )
+
                         gr.Markdown("### ⚙️ 설정")
                         static_threshold = gr.Slider(
                             minimum=0.8,
                             maximum=0.99,
-                            value=0.97,
+                            value=config_manager.get('segmentation.static_threshold', 0.97),
                             step=0.01,
                             label="정적 임계값",
                             info="높을수록 더 많이 제거됨"
                         )
-                        min_static_duration = gr.Slider(
-                            minimum=0.1,
-                            maximum=5.0,
-                            value=0.1,
-                            step=0.1,
-                            label="최소 정적 길이 (초)",
-                            info="이보다 짧은 정적 구간은 무시"
+                        min_static_duration_frames = gr.Slider(
+                            minimum=1,
+                            maximum=300,
+                            value=config_manager.get('segmentation.min_static_duration_frames', 6),
+                            step=1,
+                            label="최소 정적 길이 (프레임)",
+                            info="이보다 짧은 정적 구간은 무시 (예: 60fps 기준 6프레임 = 0.1초)"
                         )
                         target_duration = gr.Slider(
                             minimum=10,
                             maximum=120,
-                            value=30,
+                            value=config_manager.get('segmentation.target_duration', 30),
                             step=5,
                             label="목표 세그먼트 길이 (초)"
                         )
                         use_gpu = gr.Checkbox(
                             label="GPU 가속 사용",
-                            value=True,
+                            value=config_manager.get('segmentation.use_gpu', True),
                             info="PyTorch 설치 필요"
+                        )
+                        save_discarded = gr.Checkbox(
+                            label="채택되지 않은 구간도 저장 (else 폴더)",
+                            value=config_manager.get('segmentation.save_discarded', False),
+                            info="정적 구간 등 제외된 부분을 별도 저장"
                         )
 
                         segment_btn = gr.Button("🚀 세그멘테이션 시작", variant="primary", size="lg")
@@ -293,14 +400,33 @@ def create_ui():
                         )
 
                 # 이벤트 연결
+                open_explorer_btn.click(
+                    fn=open_explorer,
+                    outputs=output_status
+                ).then(
+                    lambda: gr.update(visible=True),
+                    outputs=output_status
+                )
+
+                save_output_btn.click(
+                    fn=save_output_directory,
+                    inputs=output_directory,
+                    outputs=output_status
+                ).then(
+                    lambda: gr.update(visible=True),
+                    outputs=output_status
+                )
+
                 segment_btn.click(
                     fn=segment_video_ui,
                     inputs=[
                         video_input,
                         static_threshold,
-                        min_static_duration,
+                        min_static_duration_frames,
                         target_duration,
-                        use_gpu
+                        use_gpu,
+                        save_discarded,
+                        output_directory
                     ],
                     outputs=[result_output, graph_output]
                 )

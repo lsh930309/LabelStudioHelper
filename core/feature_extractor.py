@@ -24,18 +24,28 @@ class FeatureExtractor:
     - 배치 유사도 계산 GPU 최적화
     """
 
-    def __init__(self, device=None, use_fp16: bool = True):
+    def __init__(self, device=None, use_fp16: bool = True, use_compile: bool = True):
         """
         Feature Extractor 초기화
 
         Args:
             device: torch.device (None이면 자동 감지)
             use_fp16: FP16 사용 여부 (GPU에서만)
+            use_compile: torch.compile() 사용 여부 (PyTorch 2.0+, 성능 20-30% 향상)
+                        문제 발생 시 False로 설정하여 비활성화 가능
         """
         self.device = device
         self.use_fp16 = use_fp16
+        self.use_compile = use_compile
         self.model = None
         self.transform = None
+
+        # 멀티 스트림 파이프라이닝
+        self.preprocessing_stream = None  # CPU 전처리 + GPU 전송
+        self.compute_stream = None        # GPU 연산
+
+        # Pinned memory pool (CPU-GPU 전송 가속)
+        self.pinned_memory_pool = []
 
         # PyTorch import 및 모델 로드
         self._init_model()
@@ -44,35 +54,6 @@ class FeatureExtractor:
         """ResNet18 모델 초기화"""
         try:
             self._add_pytorch_path()
-
-            # PyAV import 문제 우회 (torchvision이 PyAV를 체크하기 전에 처리)
-            # PyAV가 패키징 환경에서 제대로 로드되지 않을 때를 대비
-            import types
-
-            def _create_fake_av_logging():
-                """가짜 av.logging 모듈 생성 (필요한 함수 포함)"""
-                fake_logging = types.ModuleType('av.logging')
-                # torchvision이 사용하는 함수들을 빈 함수로 추가
-                fake_logging.set_level = lambda level: None
-                fake_logging.get_level = lambda: 0
-                return fake_logging
-
-            try:
-                import av
-                # av.logging이 없거나 set_level이 없으면 추가
-                if not hasattr(av, 'logging'):
-                    av.logging = _create_fake_av_logging()
-                    sys.modules['av.logging'] = av.logging
-                elif not hasattr(av.logging, 'set_level'):
-                    # logging 모듈은 있지만 set_level이 없는 경우
-                    av.logging.set_level = lambda level: None
-                    av.logging.get_level = lambda: 0
-            except ImportError:
-                # av가 없으면 가짜 모듈 생성
-                fake_av = types.ModuleType('av')
-                fake_av.logging = _create_fake_av_logging()
-                sys.modules['av'] = fake_av
-                sys.modules['av.logging'] = fake_av.logging
 
             # PyTorch import 시도 (상세한 에러 메시지)
             try:
@@ -93,12 +74,21 @@ class FeatureExtractor:
 
             import torch.nn as nn
 
-            # torchvision import 시 PyAV 관련 경고 무시
+            # torchvision import (PyAV 없어도 정상 작동, video reader는 사용 안 함)
+            # PyAV 관련 경고/에러는 무시
             import warnings
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", category=UserWarning)
-                import torchvision.models as models
-                import torchvision.transforms as T
+                warnings.filterwarnings("ignore", category=RuntimeWarning)
+                try:
+                    import torchvision.models as models
+                    import torchvision.transforms as T
+                except Exception as e:
+                    # torchvision import 실패 시에도 계속 진행
+                    # (PyAV 문제일 가능성이 높지만 ResNet 사용에는 문제 없음)
+                    print(f"⚠️ torchvision import 경고 (무시됨): {e}")
+                    import torchvision.models as models
+                    import torchvision.transforms as T
 
             # 디바이스 자동 감지
             if self.device is None:
@@ -129,6 +119,42 @@ class FeatureExtractor:
             if self.use_fp16 and self.device.type == 'cuda':
                 self.model = self.model.half()
 
+            # torch.compile() 사용 (PyTorch 2.0+, 20-30% 성능 향상)
+            if self.use_compile and self.device.type == 'cuda':
+                try:
+                    # PyTorch 버전 확인
+                    torch_version = tuple(int(x) for x in torch.__version__.split('.')[:2])
+                    if torch_version >= (2, 0):
+                        print("🔄 torch.compile() 적용 시도 중...")
+                        # mode='reduce-overhead': 작은 모델에 최적화
+                        # mode='max-autotune': 최대 성능 (컴파일 시간 김)
+                        # mode='default': 균형잡힌 설정
+
+                        # Triton 설치 여부 확인
+                        try:
+                            import triton
+                            print("   - Triton 발견, torch.compile() 활성화")
+                            self.model = torch.compile(self.model, mode='reduce-overhead')
+                            print("✅ torch.compile() 적용 완료 (성능 20-30% 향상 예상)")
+                        except ImportError:
+                            print("⚠️ Triton이 설치되지 않아 torch.compile()을 사용할 수 없습니다.")
+                            print("   일반 모드로 계속 진행합니다. (성능은 여전히 우수합니다)")
+                            print("   Triton 설치 방법: pip install triton")
+                            self.use_compile = False  # compile 비활성화 표시
+                    else:
+                        print(f"ℹ️ PyTorch {torch.__version__}는 torch.compile()을 지원하지 않습니다 (2.0+ 필요)")
+                        self.use_compile = False
+                except Exception as e:
+                    print(f"⚠️ torch.compile() 적용 실패: {e}")
+                    print("   일반 모드로 계속 진행합니다.")
+                    self.use_compile = False
+
+            # 멀티 CUDA 스트림 생성 (파이프라이닝)
+            if self.device.type == 'cuda':
+                self.preprocessing_stream = torch.cuda.Stream()
+                self.compute_stream = torch.cuda.Stream()
+                print("✅ 멀티 스트림 파이프라이닝 활성화")
+
             # ImageNet 정규화 파라미터 (GPU 텐서로 미리 생성)
             self.mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 3, 1, 1)
             self.std = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 3, 1, 1)
@@ -136,7 +162,29 @@ class FeatureExtractor:
                 self.mean = self.mean.half()
                 self.std = self.std.half()
 
-            print(f"✅ ResNet18 Feature Extractor 초기화 완료 (GPU: {torch.cuda.get_device_name(0)})")
+            # GPU 메모리 풀 사전 할당 (OOM 방지)
+            if self.device.type == 'cuda':
+                try:
+                    # 더미 텐서로 메모리 풀 워밍업
+                    dummy_batch = torch.randn(32, 3, 224, 224, device=self.device)
+                    if self.use_fp16:
+                        dummy_batch = dummy_batch.half()
+                    with torch.inference_mode():
+                        _ = self.model(dummy_batch)
+                    torch.cuda.synchronize()
+                    del dummy_batch
+                    torch.cuda.empty_cache()
+                    print("✅ GPU 메모리 풀 워밍업 완료")
+                except Exception as e:
+                    print(f"⚠️ GPU 메모리 풀 워밍업 실패 (무시됨): {e}")
+
+            print(f"✅ ResNet18 Feature Extractor 초기화 완료")
+            print(f"   - GPU: {torch.cuda.get_device_name(0)}")
+            print(f"   - FP16: {'활성화' if self.use_fp16 else '비활성화'}")
+            compile_status = '활성화' if self.use_compile else '비활성화'
+            if not self.use_compile and self.device.type == 'cuda':
+                compile_status += ' (Triton 없음)'
+            print(f"   - torch.compile(): {compile_status}")
 
         except ImportError as e:
             raise RuntimeError(f"PyTorch를 import할 수 없습니다: {e}")
@@ -177,12 +225,13 @@ class FeatureExtractor:
         except Exception:
             pass
 
-    def _preprocess_frames_gpu(self, frames: List[np.ndarray]):
+    def _preprocess_frames_gpu(self, frames: List[np.ndarray], use_pinned: bool = True):
         """
-        프레임을 GPU에서 직접 전처리 (CPU 연산 최소화)
+        프레임을 GPU에서 직접 전처리 (파이프라이닝 최적화)
 
         Args:
             frames: BGR 이미지 리스트 (OpenCV 포맷)
+            use_pinned: Pinned memory 사용 여부 (CPU-GPU 전송 가속)
 
         Returns:
             전처리된 GPU 텐서 (N, 3, 224, 224)
@@ -190,27 +239,49 @@ class FeatureExtractor:
         import torch
         import torch.nn.functional as F
 
-        # BGR → RGB 변환 및 텐서 변환 (배치로 한번에)
+        # BGR → RGB 변환 (CPU에서 빠르게)
         batch_np = np.stack([cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in frames])
-        
-        # NumPy → Torch (GPU로 직접 이동, non_blocking)
-        batch_tensor = torch.from_numpy(batch_np).to(self.device, non_blocking=True)
-        
-        # (N, H, W, C) → (N, C, H, W)
-        batch_tensor = batch_tensor.permute(0, 3, 1, 2)
-        
-        # FP16/FP32 변환 및 정규화 [0, 255] → [0, 1]
-        if self.use_fp16:
-            batch_tensor = batch_tensor.half() / 255.0
+
+        # Pinned memory 사용 (CPU-GPU 전송 2-3배 빠름)
+        if use_pinned and self.device.type == 'cuda':
+            # Pinned memory에 복사
+            pinned_tensor = torch.from_numpy(batch_np).pin_memory()
+
+            # 전처리 스트림에서 GPU로 비동기 전송
+            with torch.cuda.stream(self.preprocessing_stream):
+                batch_tensor = pinned_tensor.to(self.device, non_blocking=True)
+
+                # (N, H, W, C) → (N, C, H, W)
+                batch_tensor = batch_tensor.permute(0, 3, 1, 2)
+
+                # FP16/FP32 변환 및 정규화 [0, 255] → [0, 1]
+                if self.use_fp16:
+                    batch_tensor = batch_tensor.half() / 255.0
+                else:
+                    batch_tensor = batch_tensor.float() / 255.0
+
+                # 리사이즈 (224x224)
+                batch_tensor = F.interpolate(batch_tensor, size=(224, 224), mode='bilinear', align_corners=False)
+
+                # ImageNet 정규화 (GPU에서 직접)
+                batch_tensor = (batch_tensor - self.mean) / self.std
+
+            # 계산 스트림이 전처리 스트림을 기다림
+            self.compute_stream.wait_stream(self.preprocessing_stream)
+
         else:
-            batch_tensor = batch_tensor.float() / 255.0
-        
-        # 리사이즈 (224x224)
-        batch_tensor = F.interpolate(batch_tensor, size=(224, 224), mode='bilinear', align_corners=False)
-        
-        # ImageNet 정규화 (GPU에서 직접)
-        batch_tensor = (batch_tensor - self.mean) / self.std
-        
+            # Pinned memory 없이 처리
+            batch_tensor = torch.from_numpy(batch_np).to(self.device, non_blocking=True)
+            batch_tensor = batch_tensor.permute(0, 3, 1, 2)
+
+            if self.use_fp16:
+                batch_tensor = batch_tensor.half() / 255.0
+            else:
+                batch_tensor = batch_tensor.float() / 255.0
+
+            batch_tensor = F.interpolate(batch_tensor, size=(224, 224), mode='bilinear', align_corners=False)
+            batch_tensor = (batch_tensor - self.mean) / self.std
+
         return batch_tensor
 
     def extract_frame_features(self, frames: List[np.ndarray]) -> np.ndarray:
@@ -252,7 +323,7 @@ class FeatureExtractor:
 
     def _extract_features_gpu(self, frames: List[np.ndarray]):
         """
-        프레임 배치에서 feature 추출 (GPU 텐서 유지)
+        프레임 배치에서 feature 추출 (GPU 텐서 유지, 파이프라이닝 최적화)
 
         Args:
             frames: BGR 이미지 리스트
@@ -265,14 +336,18 @@ class FeatureExtractor:
         if not frames:
             return None
 
-        # GPU에서 전처리
+        # GPU에서 전처리 (전처리 스트림 사용)
         batch_tensor = self._preprocess_frames_gpu(frames)
 
-        # Feature 추출 (GPU 유지)
-        with torch.inference_mode():
-            features = self.model(batch_tensor)
-            # L2 정규화
-            features = torch.nn.functional.normalize(features, dim=1)
+        # Feature 추출 (계산 스트림에서 실행)
+        with torch.cuda.stream(self.compute_stream):
+            with torch.inference_mode():
+                features = self.model(batch_tensor)
+                # L2 정규화
+                features = torch.nn.functional.normalize(features, dim=1)
+
+        # 메인 스트림이 계산 스트림을 기다림
+        torch.cuda.current_stream().wait_stream(self.compute_stream)
 
         return features
 
@@ -340,10 +415,22 @@ class FeatureExtractor:
         try:
             import torch
             if self.device and self.device.type == 'cuda':
+                # 멀티 스트림 동기화
+                if self.preprocessing_stream:
+                    self.preprocessing_stream.synchronize()
+                    self.preprocessing_stream = None
+                if self.compute_stream:
+                    self.compute_stream.synchronize()
+                    self.compute_stream = None
+
                 del self.model
                 del self.mean
                 del self.std
                 self.model = None
+
+                # Pinned memory 정리
+                self.pinned_memory_pool.clear()
+
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
         except:
